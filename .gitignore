@@ -2,3 +2,4 @@
 data/
 _pycache__/
 .vscode/
+*.parquet
