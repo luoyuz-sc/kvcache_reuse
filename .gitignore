@@ -3,3 +3,8 @@ data/
 _pycache__/
 .vscode/
 *.parquet
+adapter_out/
+*.log
+dataset/
+checkpoints/
+log/

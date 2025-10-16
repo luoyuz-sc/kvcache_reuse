@@ -3,3 +3,7 @@
 1.7B EM: 47.00, F1: 58.10
 0.6B->1.7B EM: 48.00, F1: 58.33
 1.7B->0.6B EM: 31.00, F1: 39.89
+
+Evaluation Qwen/Qwen3-0.6B: EM: 0.2600, F1: 0.3254
+Evaluation Qwen/Qwen3-1.7B: EM: 0.4800, F1: 0.5800
+Evaluation : EM: 0.3400, F1: 0.4233
