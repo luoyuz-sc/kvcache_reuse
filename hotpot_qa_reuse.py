@@ -355,6 +355,56 @@ class RegularMLP(nn.Module):
             if self.use_layernorm:
                 out = self.norms[i](out)
         return out
+
+class KAdapter_(nn.Module):
+    """Simple MLP to adapt teacher KV to align better with student expectations."""
+    def __init__(self, input_size: int, hidden_size: int = None, output_size: int = None):
+        super().__init__()
+        hidden_size = hidden_size or input_size
+        output_size = output_size or input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.mlp = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, output_size),
+        )
+        self.norm = RMSNorm(output_size)
+        
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: [batch, seq_len, num_heads, head_dim]
+        B, H, S, D = x.shape
+        x_flat = x.view(B * S * H, D)
+        out_flat = self.norm(self.mlp(x_flat))
+        return out_flat.view(B, H, S, self.output_size)
+    
+class VAdapter_(nn.Module):
+    """Simple MLP to adapt teacher KV to align better with student expectations."""
+    def __init__(self, input_size: int, hidden_size: int = None, output_size: int = None):
+        super().__init__()
+        hidden_size = hidden_size or input_size
+        output_size = output_size or input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.mlp = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, output_size),
+            nn.LayerNorm(output_size),
+        )
+        
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: [batch, seq_len, num_heads, head_dim]
+        B, H, S, D = x.shape
+        x_flat = x.view(B * S * H, D)
+        out_flat = self.mlp(x_flat)
+        return out_flat.view(B, H, S, self.output_size)
 class KAdapter(nn.Module):
     """
     Adapter that converts teacher K (multiple heads) -> student-expected K shape.
@@ -369,7 +419,7 @@ class KAdapter(nn.Module):
         receive_head_dim: int,
         hidden_dim: int = None,
         intermediate_dim: int = None,
-        num_layers: int = 2,
+        num_layers: int = 3,
     ):
         super().__init__()
         self.send_heads = send_heads
@@ -792,6 +842,52 @@ def evaluate_distr(args):
 def l2norm(tensor):
     return torch.sqrt(torch.sum(tensor ** 2)) 
 
+class KVCacheDataset(Dataset):
+    """Load precomputed student KV cache from disk."""
+    def __init__(self, cache_dir, metadata_path=None):
+        self.cache_dir = cache_dir
+        self.files = sorted([f for f in os.listdir(cache_dir) if f.endswith(".pt")])
+        assert len(self.files) > 0, f"No .pt files found in {cache_dir}"
+        
+        # Load metadata (optional)
+        if metadata_path and os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                meta = json.load(f)
+            print(f"Loaded metadata: {meta}")
+
+    def __len__(self): 
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        path = os.path.join(self.cache_dir, self.files[idx])
+        pkv_s = torch.load(path)  # List[(k, v)] on CPU
+        return pkv_s
+    
+def load_target_pkv_batch(args, tokenizer, examples, device):
+    """
+    On-the-fly 获取 teacher 的 KV（只做一次）
+    如果你也想离线 precompute teacher KV，可以扩展 precompute_kv.py
+    """
+    model_t = AutoModelForCausalLM.from_pretrained(
+        args.model_t,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True
+    ).to(device).eval()
+
+    all_pkv_t = []
+    with torch.no_grad():
+        pbar = tqdm(examples, desc="load target kv process")
+        for example in pbar:
+            input_ids = torch.tensor([get_input_ids_list(tokenizer, example)], device=device)
+            out = model_t(input_ids=input_ids, use_cache=True)
+            pkv_t = [(k.cpu(), v.cpu()) for k, v in out.past_key_values]
+            all_pkv_t.append(pkv_t)
+            del input_ids, out
+            torch.cuda.empty_cache()
+    
+    return all_pkv_t
+
 def precompute_and_save_kv(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -815,36 +911,120 @@ def precompute_and_save_kv(args):
     # 保存元信息
     meta = {
         "model_s": args.model_s,
-        "max_length": args.max_length,
-        "description": "KV Cache from student model (prefill only)"
+        "description": "KV Cache from source model (prefill only)"
     }
     with open(os.path.join(args.output_dir, "kv_cache_meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
     # 加载数据集
-    ds = load_dataset("parquet", data_files={"train": args.train_file})["train"]
+    ds = HotPotQADataset({"train": args.train_file}, num= None, split="train")
     print(f"Loaded {len(ds)} training examples")
+    
+    dataloader = DataLoader(ds, batch_size=1, shuffle=False, collate_fn=lambda x: x)
+    
+    print("Starting KV Cache precomputation...")
+    failed_count = 0
+    success_count = 0
 
-def train(args):
-    # Load models and tokenizer
-    device="cuda:1"
+    with torch.no_grad():
+        pbar = tqdm(dataloader, desc="Prefill Progress")
+        for step, batch in enumerate(pbar):
+            if step < args.start_idx: continue
+            if args.end_idx and step >= args.end_idx: break
+            ex = batch[0]
+            try:
+                input_ids = torch.tensor([get_input_ids_list(tokenizer, ex)], device=device)
+            
+                # Prefill with student model
+                out = model_s(input_ids=input_ids, use_cache=True)
+                pkv = out.past_key_values  # tuple of (k, v)
+
+                # Convert to FP16 and move to CPU
+                cpu_pkv = []
+                for k, v in pkv:
+                    cpu_pkv.append((
+                        k.cpu(),   # FP16 + CPU
+                        v.cpu()
+                    ))
+                cpu_pkv = tuple(cpu_pkv)
+
+                # Save as .pt file
+                save_path = os.path.join(cache_dir, f"{step:06d}.pt")
+                torch.save(cpu_pkv, save_path)
+
+                success_count += 1
+                if success_count % 50 == 0:
+                    print(f"Saved {success_count} KV caches so far...")
+
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"OOM at step {step}, consider reducing max_length or using smaller model.")
+                    # 清理显存
+                    torch.cuda.empty_cache()
+                    failed_count += 1
+                    continue
+                else:
+                    print(f"RuntimeError at step {step}: {e}")
+                    failed_count += 1
+            except Exception as e:
+                print(f"Failed to process example {step}: {e}")
+                failed_count += 1
+
+            # Clean up
+            del input_ids, out
+            if step % 10 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+    # Final report
+    print(f"\n✅ Precomputation completed!")
+    print(f"   Success: {success_count}")
+    print(f"   Failed:  {failed_count}")
+    print(f"   Output saved to: {cache_dir}")
+
+    # Save stats
+    stats = {
+        "total_examples": len(ds),
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "output_dir": cache_dir,
+        "model_s": args.model_s
+    }
+    with open(os.path.join(args.output_dir, "precompute_stats.json"), "w") as f:
+        json.dump(stats, f, indent=2)
+        
+def train_with_cached_kv(args):
+    device="cuda:7"
     tokenizer = AutoTokenizer.from_pretrained(args.model_t)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model_s = AutoModelForCausalLM.from_pretrained(args.model_s, trust_remote_code=True,low_cpu_mem_usage=True).to(device)
-    model_t = AutoModelForCausalLM.from_pretrained(args.model_t, trust_remote_code=True,low_cpu_mem_usage=True).to(device)
-    model_s.eval().requires_grad_(False)
-    model_t.eval().requires_grad_(False)
+    # -------------------------------
+    # 加载预计算的 student KV Cache
+    # -------------------------------
+    cache_dir = os.path.join(args.cache_dir, "kvcache_train")
+    dataset = KVCacheDataset(cache_dir)
+
+    grad_accum_steps = args.grad_accum_steps
+
+    # -------------------------------
+    # 加载 teacher 的 KV（一次性）
+    # -------------------------------
+    print("Loading target model to compute target KV...")
+    train_data = HotPotQADataset({"train":args.train_file}, num=3000,split="train")
+    # 只取前 len(dataset) 个样本
+    examples = [train_data[i] for i in range(len(dataset))]
+    target_pkvs = load_target_pkv_batch(args, tokenizer, examples, device)
+    print(f"Loaded {len(target_pkvs)} target KV caches.")
 
     # Build MLP adapters
-    N_s = len(model_s.model.layers)
-    N_t = len(model_t.model.layers)
+    N_s = 28
+    N_t = 28
 
-    head_dim_s = getattr(model_s.config, "head_dim", model_s.config.hidden_size // model_s.config.num_attention_heads)
-    head_dim_t = getattr(model_t.config, "head_dim", model_t.config.hidden_size // model_t.config.num_attention_heads)
-    head_num_s = getattr(model_s.config, "num_key_value_heads", getattr(model_s.config, "num_attention_heads", None))
-    head_num_t = getattr(model_t.config, "num_key_value_heads", getattr(model_t.config, "num_attention_heads", None))
+    head_dim_s = 128
+    head_dim_t = 128
+    head_num_s = 8
+    head_num_t = 8
     
     k_mlps = AdapterBank(
         KAdapter(head_num_s, head_dim_s, head_num_t, head_dim_t) for _ in range(N_t)
@@ -856,10 +1036,6 @@ def train(args):
     
     mse_loss = nn.MSELoss()
 
-    # Data loader
-    dataset = HotPotQADataset({"train": args.train_file}, num= 1000, split="train")
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=lambda x: x)
-
     grad_accum_steps = args.grad_accum_steps
 
     
@@ -868,15 +1044,11 @@ def train(args):
     for epoch in range(args.epochs):
         k_mlps.train()
         total_loss = 0.0
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
-        for step, batch in enumerate(pbar):
-            example = batch[0]
-            input_ids = torch.tensor([get_input_ids_list(tokenizer, example)], device=device)
-            with torch.no_grad():
-                s_out = model_s(input_ids=input_ids, use_cache=True)
-                t_out = model_t(input_ids=input_ids, use_cache=True)
-                pkv_s = tuple(tuple(t.detach() for t in layer) for layer in s_out.past_key_values)
-                pkv_t = tuple(tuple(t.detach() for t in layer) for layer in t_out.past_key_values)
+        pbar = tqdm(dataset, desc=f"Epoch {epoch+1}")
+        for step, pkv_s in enumerate(pbar):
+            
+            pkv_s = [(k.to(device), v.to(device)) for k, v in pkv_s]
+            pkv_t = [(k.to(device), v.to(device)) for k, v in target_pkvs[step]]
 
             loss = 0.0
             dist = 0.0
@@ -904,14 +1076,14 @@ def train(args):
 
             pbar.set_postfix({"loss": total_loss / (step+1),"dist": dist.item()/cnt})
             
-            del s_out, t_out, pkv_s, pkv_t, k_adapted, loss, dist
+            del pkv_s, pkv_t, k_adapted, loss, dist
             if step % 10 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
             
         print(f"Epoch {epoch+1}, Avg Loss: {total_loss / len(pbar):.4f}")
 
-        save_path = os.path.join(args.output_dir, f"new_mlp_k_adapters_epoch{epoch+1}.pth")
+        save_path = os.path.join(args.output_dir, f"pre_mlp_k_adapters_epoch{epoch+1}.pth")
         torch.save(k_mlps.state_dict(), save_path)
         print(f"✅ Saved to {save_path}")
 
@@ -922,17 +1094,12 @@ def train(args):
     for epoch in range(args.epochs):
         v_mlps.train()
         total_loss = 0.0
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+        pbar = tqdm(dataset, desc=f"Epoch {epoch+1}")
 
-        for step, batch in enumerate(pbar):
-            example = batch[0]
-            input_ids = torch.tensor([get_input_ids_list(tokenizer, example)], device=device)
-            text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-            with torch.no_grad():
-                s_out = model_s(input_ids=input_ids, use_cache=True)
-                t_out = model_t(input_ids=input_ids, use_cache=True)
-                pkv_s = tuple(tuple(t.detach() for t in layer) for layer in s_out.past_key_values)
-                pkv_t = tuple(tuple(t.detach() for t in layer) for layer in t_out.past_key_values)
+        for step, pkv_s in enumerate(pbar):
+           
+            pkv_s = [(k.to(device), v.to(device)) for k, v in pkv_s]
+            pkv_t = [(k.to(device), v.to(device)) for k, v in target_pkvs[step]]
 
             loss = torch.tensor(0.0, device=device)
             dist = torch.tensor(0.0, device=device)
@@ -959,6 +1126,163 @@ def train(args):
             total_loss += avg_loss * grad_accum_steps
 
             pbar.set_postfix({"loss": total_loss / (step + 1),"dist": dist.item()/cnt})
+            
+            del pkv_s, pkv_t, v_adapted, loss, dist
+            torch.cuda.empty_cache()
+
+        print(f"Epoch {epoch+1}, Avg Loss: {total_loss / len(pbar):.4f}")
+    
+        
+        save_path = os.path.join(args.output_dir, f"pre_mlp_v_adapters_epoch{epoch+1}.pth")
+        torch.save(v_mlps.state_dict(),save_path)
+        print(f"✅ Saved to {save_path}")
+        
+def print_gpu_memory(device):
+    allocated = torch.cuda.memory_allocated(device) / (1024**3)  # GB
+    reserved   = torch.cuda.memory_reserved(device)   / (1024**3)
+    free, total = torch.cuda.mem_get_info(device)
+    used = total - free
+    used_gb = used / (1024**3)
+
+    print(f"[{device}] GPU Memory:")
+    print(f"  Allocated: {allocated:.2f} GB")
+    print(f"  Reserved:  {reserved:.2f} GB")
+    print(f"  Used:      {used_gb:.2f} GB")
+    print(f"  Free:      {free / (1024**3):.2f} GB")
+    print(f"  Max Alloc: {torch.cuda.max_memory_allocated(device) / (1024**3):.2f} GB")
+
+def train(args):
+    # Load models and tokenizer
+    device="cuda:0"
+    device0="cuda:1"
+    tokenizer = AutoTokenizer.from_pretrained(args.model_t)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model_s = AutoModelForCausalLM.from_pretrained(args.model_s, trust_remote_code=True,low_cpu_mem_usage=True).to(device0)
+    model_t = AutoModelForCausalLM.from_pretrained(args.model_t, trust_remote_code=True,low_cpu_mem_usage=True).to(device)
+    model_s.eval().requires_grad_(False)
+    model_t.eval().requires_grad_(False)
+
+    # Build MLP adapters
+    N_s = len(model_s.model.layers)
+    N_t = len(model_t.model.layers)
+
+    head_dim_s = getattr(model_s.config, "head_dim", model_s.config.hidden_size // model_s.config.num_attention_heads)
+    head_dim_t = getattr(model_t.config, "head_dim", model_t.config.hidden_size // model_t.config.num_attention_heads)
+    head_num_s = getattr(model_s.config, "num_key_value_heads", getattr(model_s.config, "num_attention_heads", None))
+    head_num_t = getattr(model_t.config, "num_key_value_heads", getattr(model_t.config, "num_attention_heads", None))
+    
+    k_mlps = AdapterBank(
+        KAdapter(head_num_s, head_dim_s, head_num_t, head_dim_t) for _ in range(N_t)
+        ).to(device)
+    
+    v_mlps = AdapterBank(
+        KAdapter(head_num_s, head_dim_s, head_num_t, head_dim_t) for _ in range(N_t)
+        ).to(device)
+    
+    mse_loss = nn.MSELoss()
+
+    # Data loader
+    dataset = HotPotQADataset({"train": args.train_file}, num= None, split="train")
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=lambda x: x)
+
+    grad_accum_steps = args.grad_accum_steps
+
+    
+    print("Starting training k adapter...")
+    optimizer = optim.Adam(k_mlps.parameters(), lr=args.lr)
+    for epoch in range(args.epochs):
+        k_mlps.train()
+        total_loss = 0.0
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+        for step, batch in enumerate(pbar):
+            example = batch[0]
+            input_ids = torch.tensor([get_input_ids_list(tokenizer, example)], device=device)
+            input_ids0 = torch.tensor([get_input_ids_list(tokenizer, example)], device=device0)
+            with torch.no_grad():
+                s_out = model_s(input_ids=input_ids0, use_cache=True)
+                t_out = model_t(input_ids=input_ids, use_cache=True)
+                pkv_s = tuple(tuple(t.detach().to(device) for t in layer) for layer in s_out.past_key_values)
+                pkv_t = tuple(tuple(t.detach() for t in layer) for layer in t_out.past_key_values)
+
+            loss = 0.0
+            dist = 0.0
+            cnt = 0
+            for i in range(args.reuse_a_layer_start, N_t):
+                s_idx = map_layer_nearest(i, N_s, N_t)
+                k_s, v_s = pkv_s[s_idx]
+                k_t, v_t = pkv_t[i]
+                k_adapted = k_mlps(k_s, s_idx)
+                loss += mse_loss(k_adapted, k_t.to(dtype=k_adapted.dtype)) 
+                dist += mse_loss(k_s.to(dtype=k_adapted.dtype), k_t.to(dtype=k_adapted.dtype))
+                cnt += 1
+
+            if cnt > 0:
+                loss = loss / cnt
+
+            loss = loss / grad_accum_steps
+            loss.backward()
+            if (step + 1) % grad_accum_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            avg_loss = loss.item()
+            total_loss += avg_loss * grad_accum_steps
+
+            pbar.set_postfix({"loss": avg_loss * grad_accum_steps,"dist": dist.item()/cnt})
+            
+            
+        print(f"Epoch {epoch+1}, Avg Loss: {total_loss / len(pbar):.4f}")
+
+        save_path = os.path.join(args.output_dir, f"new_mlp_k_adapters_epoch{epoch+1}.pth")
+        torch.save(k_mlps.state_dict(), save_path)
+        print(f"✅ Saved to {save_path}")
+    
+    
+            
+    print("Starting training v adapter...")
+    optimizer = optim.Adam(v_mlps.parameters(), lr=args.lr)
+    for epoch in range(args.epochs):
+        v_mlps.train()
+        total_loss = 0.0
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+
+        for step, batch in enumerate(pbar):
+            example = batch[0]
+            input_ids = torch.tensor([get_input_ids_list(tokenizer, example)], device=device)
+            input_ids0 = torch.tensor([get_input_ids_list(tokenizer, example)], device=device0)
+            with torch.no_grad():
+                s_out = model_s(input_ids=input_ids0, use_cache=True)
+                t_out = model_t(input_ids=input_ids, use_cache=True)
+                pkv_s = tuple(tuple(t.detach().to(device) for t in layer) for layer in s_out.past_key_values)
+                pkv_t = tuple(tuple(t.detach() for t in layer) for layer in t_out.past_key_values)
+
+            loss = torch.tensor(0.0, device=device)
+            dist = torch.tensor(0.0, device=device)
+            cnt = 0
+            for i in range(args.reuse_a_layer_start, N_t):
+                s_idx = map_layer_nearest(i, N_s, N_t)
+                k_s, v_s = pkv_s[s_idx]
+                k_t, v_t = pkv_t[i]
+                v_adapted = v_mlps(v_s, s_idx)
+                loss += mse_loss(v_adapted, v_t.to(dtype=v_adapted.dtype)) 
+                dist += mse_loss(v_s.to(dtype=v_adapted.dtype), v_t.to(dtype=v_adapted.dtype))
+                cnt += 1
+
+            if cnt > 0:
+                loss = loss / cnt
+
+            loss = loss / grad_accum_steps
+            loss.backward()
+            if (step + 1) % grad_accum_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            avg_loss = loss.item()
+            total_loss += avg_loss * grad_accum_steps
+
+            pbar.set_postfix({"loss": avg_loss * grad_accum_steps,"dist": dist.item()/cnt})
             
             del s_out, t_out, pkv_s, pkv_t, v_adapted, loss, dist
             torch.cuda.empty_cache()
@@ -1168,7 +1492,7 @@ def train_dis(args):
 
 # ---------------- Evaluation ----------------
 def evaluate(args, adpater=False):
-
+    
     tokenizer = AutoTokenizer.from_pretrained(args.model_t)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -1182,21 +1506,25 @@ def evaluate(args, adpater=False):
     start = args.reuse_a_layer_start
     head_dim_s = getattr(model_s.config, "head_dim", ...)
     head_dim_t = getattr(model_t.config, "head_dim", ...)
+    head_num_s = 8
+    head_num_t = 8
 
     if adpater:
         print("Using provided adapter for evaluation.")
         k_mlps = AdapterBank(
-            [KAdapter(head_dim_s, head_dim_s * 2, head_dim_t) for _ in range(N_t)],
-            ).to(device)
-        ckpt = os.path.join(args.output_dir, f"mlp_k_adapters_epoch{10}.pth")
+        KAdapter(head_num_s, head_dim_s, head_num_t, head_dim_t) for _ in range(N_t)
+        ).to(device)
+    
+        v_mlps = AdapterBank(
+        KAdapter(head_num_s, head_dim_s, head_num_t, head_dim_t) for _ in range(N_t)
+        ).to(device)
+        
+        ckpt = os.path.join(args.output_dir, f"new_mlp_k_adapters_epoch{10}.pth")
         state_dict = torch.load(ckpt, map_location=device)
         k_mlps.load_state_dict(state_dict)
         k_mlps.eval()
         
-        v_mlps = AdapterBank(
-            [VAdapter(head_dim_s, head_dim_s * 2, head_dim_t) for _ in range(N_t)],
-            ).to(device)
-        ckpt = os.path.join(args.output_dir, f"mlp_v_adapters_epoch{10}.pth")
+        ckpt = os.path.join(args.output_dir, f"new_mlp_v_adapters_epoch{4}.pth")
         state_dict = torch.load(ckpt, map_location=device)
         v_mlps.load_state_dict(state_dict)
         v_mlps.eval()
@@ -1206,7 +1534,7 @@ def evaluate(args, adpater=False):
         k_mlps, v_mlps = None, None
 
     # Load eval data
-    ds = HotPotQADataset({"valid": args.valid_file}, num=300, split="valid")
+    ds = HotPotQADataset({"valid": args.valid_file}, num=None, split="valid")
     print(f"Evaluating on {args.valid_file} with {len(ds)} examples.")
     
     total_em = total_f1 = 0.0
@@ -1263,27 +1591,28 @@ def test(args):
     head_dim_t = getattr(model_t.config, "head_dim", model_t.config.hidden_size // model_t.config.num_attention_heads)  
     
     k_mlps = AdapterBank(
-            [KAdapter(head_dim_s, head_dim_s * 2, head_dim_t) for _ in range(N_t - start)],
-            ).to(device)
-    ckpt = os.path.join(args.output_dir, f"mlp_k_adapters_epoch{1000}.pth")
+        KAdapter(8, head_dim_s, 8, head_dim_t) for _ in range(N_t)
+        ).to(device)
+    ckpt = os.path.join(args.output_dir, f"new_mlp_k_adapters_epoch{1}.pth")
     state_dict = torch.load(ckpt, map_location=device)
     k_mlps.load_state_dict(state_dict)
     k_mlps.eval()
         
     v_mlps = AdapterBank(
-            [VAdapter(head_dim_s, head_dim_s * 2, head_dim_t) for _ in range(N_t - start)],
+            [VAdapter_(head_dim_s, head_dim_s * 2, head_dim_t) for _ in range(N_t - start)],
             ).to(device)
-    ckpt = os.path.join(args.output_dir, f"mlp_v_adapters_epoch{1000}.pth")
+    ckpt = os.path.join(args.output_dir, f"mlp_v_adapters_epoch{10}.pth")
     state_dict = torch.load(ckpt, map_location=device)
     v_mlps.load_state_dict(state_dict)
     v_mlps.eval()
     
     
-    ds = HotPotQADataset({"train": args.valid_file}, num=10, split="train")
-    ds = ["What is the capital of France?", "What is the capital of China?"]
+    ds = HotPotQADataset({"train": args.valid_file}, num=1000, split="train")
+    dataLoader=DataLoader(ds,batch_size=1,shuffle=True,collate_fn=lambda x:x)
     with torch.no_grad():
-        pbar = tqdm(ds, desc="Evaluating")
-        for step, ex in enumerate(pbar):
+        pbar = tqdm(dataLoader, desc="Evaluating")
+        for step, batch in enumerate(pbar):
+            ex=batch[0]
             input_ids_list = get_input_ids_list(tokenizer, ex)
             text = tokenizer.decode(input_ids_list, skip_special_tokens=True)
             model_s_out = model_s(input_ids=torch.tensor([input_ids_list], device=device), use_cache=True)
@@ -1319,12 +1648,15 @@ def test(args):
                 ak_norm += l2norm(k_a).item()
                 av_norm += l2norm(v_a).item()
                 cnt += 1
+            '''
             print(f"kloss:{(kloss/cnt).item()},vloss:{(vloss/cnt).item()}")
             print(f"kloss_a:{(kloss_a/cnt).item()},vloss_a:{(vloss_a/cnt).item()}")
             print(f"vloss_:{(vloss_/cnt).item()}")
             print(f"tk_norm:{(tk_norm/cnt):.4f},tv_norm:{(tv_norm/cnt):.4f}")
             print(f"sk_norm:{(sk_norm/cnt):.4f},sv_norm:{(sv_norm/cnt):.4f}")
             print(f"ak_norm:{(ak_norm/cnt):.4f},av_norm:{(av_norm/cnt):.4f}")
+            '''
+            pbar.set_postfix({"kloss:":(kloss/cnt).item(),"kloss_a":(kloss_a/cnt).item()})
 
 def test1(args):
     model_s = AutoModelForCausalLM.from_pretrained(args.model_s, trust_remote_code=True).to(device).eval()
@@ -1367,6 +1699,7 @@ def test1(args):
             print("pred:",pred)
     
 
+
 # ---------------- Main ----------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -1390,6 +1723,10 @@ if __name__ == "__main__":
     parser.add_argument("--k_reuse", action="store_true")
     parser.add_argument("--v_reuse", action="store_true")
     parser.add_argument("--test1", action="store_true")
+    parser.add_argument("--pre", action="store_true")
+    parser.add_argument("--start_idx", type=int, default=0)
+    parser.add_argument("--end_idx", type=int, default=None)
+    parser.add_argument("--cache_dir", type=str, default="./precompute")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1398,6 +1735,8 @@ if __name__ == "__main__":
         test(args)
     elif args.test1:
         test1(args)
+    elif args.pre:
+        precompute_and_save_kv(args)
     else:
         if args.train:
             train(args)

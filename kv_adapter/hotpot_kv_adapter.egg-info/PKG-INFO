@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: hotpot_kv_adapter
+Version: 0.1.0
+Summary: UNKNOWN
+License: UNKNOWN
+Platform: UNKNOWN
+Requires-Dist: torch
+Requires-Dist: transformers
+Requires-Dist: datasets
+Requires-Dist: accelerate
+Requires-Dist: tqdm
+Dynamic: requires-dist
+
+UNKNOWN
