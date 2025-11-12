@@ -34,7 +34,7 @@ def handler(sig, frame):
 
 signal.signal(signal.SIGINT, handler)
 
-device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 
 def postprocess(generated: str) -> str:
     # Take only the first non-empty line; trim common prefixes.
@@ -86,7 +86,8 @@ def kv_bridged_generate(model_t,model_s, tok, k_mlps, v_mlps, input_ids_list: li
     top_p = args.top_p
 
     input_ids = torch.tensor([input_ids_list], device=device)
-
+    text = tok.decode(input_ids_list)
+    #print("text:",text)
     # prefill with s
     s_out = model_s(
         input_ids=input_ids,
@@ -108,7 +109,8 @@ def kv_bridged_generate(model_t,model_s, tok, k_mlps, v_mlps, input_ids_list: li
     new_a_cache, reuse_b_layer_list = reuse_layer_with_mlp(pkv_t, pkv_s, k_mlps,v_mlps, args)
     
     first_token = sample_next_token(t_out.logits[:,-1,:].squeeze(0), temperature, top_p)
-    
+    word = tok.decode([first_token])
+    #print("word:",word)
     past = DynamicCache.from_legacy_cache(past_key_values=new_a_cache)
     generated = [first_token]
     last_token = torch.tensor([[first_token]], device=device)
@@ -132,6 +134,8 @@ def kv_bridged_generate(model_t,model_s, tok, k_mlps, v_mlps, input_ids_list: li
         last_token = torch.tensor([[next_id]], device=device)
     
     text = tok.decode([t for t in generated if t != eos_id], skip_special_tokens=True)
+    with open("debug.log",'a') as f:
+        f.write(f"text:{text}\n")
     if ":" in text :
         pos = text.index(":")
         text=text[pos+1:].strip()
@@ -219,24 +223,16 @@ def format_context(example: Dict) -> str:
         sections.append(f"- {t}: {ss}")
     return "\n".join(sections)
 
+def format_context_wiki(example: Dict) -> str:
+    """Compact, readable multi-hop context."""
+    return example["context"]
+    
 INSTRUCT_HEADER = (
     "You are a precise question answering assistant. Use the CONTEXT to answer the QUESTION.\n"
     "Return the **shortest** possible answer begin with 'Answer: ' (e.g., single entity or 'yes'/'no'); no explanation.\n"
 )
 
 def get_input_ids_list(tokenizer, example: Dict) -> list[int]:
-    if isinstance(example, str):
-        sys = INSTRUCT_HEADER.strip()
-        messages = [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": f"QUESTION: {example}\n"}
-        ]
-        prompt_str = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            enable_thinking=False # Switches between thinking and non-thinking modes. Default is True.
-        )
-        return tokenizer(prompt_str).input_ids
     ctx = format_context(example)
     q = example["question"]
     sys = INSTRUCT_HEADER.strip()
@@ -251,16 +247,34 @@ def get_input_ids_list(tokenizer, example: Dict) -> list[int]:
     )
     return tokenizer(prompt_str).input_ids
 
-def get_answer_ids_list(tokenizer, example: Dict) -> list[str]:
-    a = example["answer"]
-    ans_str = f"Answer: {a}"
-    return tokenizer(ans_str).input_ids
+def get_input_ids_list_wiki(tokenizer, example: Dict) -> list[int]:
+    ctx = format_context_wiki(example)
+    q = example["question"]
+    sys = INSTRUCT_HEADER.strip()
+    messages = [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": f"CONTEXT:\n{ctx}\n\nQUESTION: {q}\n"}
+    ]
+    prompt_str = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        enable_thinking=False # Switches between thinking and non-thinking modes. Default is True.
+    )
+    return tokenizer(prompt_str).input_ids
 
 def eval_one(example: Dict, tok, model_t, model_s, k_mlps,v_mlps, args) -> Tuple[str, float, float]:
     input_ids_list = get_input_ids_list(tok, example)
     pred = kv_bridged_generate(model_t,model_s, tok, k_mlps,v_mlps, input_ids_list, args)
     gold = example["answer"]
     with open(f"./log/qa_result.log", "a") as f:
+        f.write(f"Q: {example['question']}\nA: {pred}\nG: {gold}\n")
+    return pred, exact_match(pred, gold), f1_score(pred, gold)
+
+def eval_one_wiki(example: Dict, tok, model_t, model_s, k_mlps,v_mlps, args) -> Tuple[str, float, float]:
+    input_ids_list = get_input_ids_list_wiki(tok, example)
+    pred = kv_bridged_generate(model_t,model_s, tok, k_mlps,v_mlps, input_ids_list, args)
+    gold = example["answer"]
+    with open(f"./log/wikiqa_result.log", "a") as f:
         f.write(f"Q: {example['question']}\nA: {pred}\nG: {gold}\n")
     return pred, exact_match(pred, gold), f1_score(pred, gold)
 
@@ -1524,7 +1538,7 @@ def evaluate(args, adpater=False):
         k_mlps.load_state_dict(state_dict)
         k_mlps.eval()
         
-        ckpt = os.path.join(args.output_dir, f"new_mlp_v_adapters_epoch{4}.pth")
+        ckpt = os.path.join(args.output_dir, f"new_mlp_v_adapters_epoch{5}.pth")
         state_dict = torch.load(ckpt, map_location=device)
         v_mlps.load_state_dict(state_dict)
         v_mlps.eval()
@@ -1534,7 +1548,7 @@ def evaluate(args, adpater=False):
         k_mlps, v_mlps = None, None
 
     # Load eval data
-    ds = HotPotQADataset({"valid": args.valid_file}, num=None, split="valid")
+    ds = HotPotQADataset({"valid": args.valid_file}, num=100, split="valid")
     print(f"Evaluating on {args.valid_file} with {len(ds)} examples.")
     
     total_em = total_f1 = 0.0
@@ -1546,8 +1560,8 @@ def evaluate(args, adpater=False):
             total_f1 += f1
             avg_em = total_em / (step + 1)
             avg_f1 = total_f1 / (step + 1)
-            pbar.set_postfix({"EM": avg_em, "F1": avg_f1})
-    with open(f"hotpotqa_result.log", "a") as f:
+            pbar.set_postfix({"EM": em, "F1": f1})
+    with open(f"wikiqa_result.log", "a") as f:
         f.write(f"Evaluation {args.reuse_a_layer_start}: EM: {avg_em:.4f}, F1: {avg_f1:.4f}\n")
 
 def eval_wo_reuse(args):
@@ -1593,21 +1607,21 @@ def test(args):
     k_mlps = AdapterBank(
         KAdapter(8, head_dim_s, 8, head_dim_t) for _ in range(N_t)
         ).to(device)
-    ckpt = os.path.join(args.output_dir, f"new_mlp_k_adapters_epoch{1}.pth")
+    ckpt = os.path.join(args.output_dir, f"new_mlp_k_adapters_epoch{10}.pth")
     state_dict = torch.load(ckpt, map_location=device)
     k_mlps.load_state_dict(state_dict)
     k_mlps.eval()
         
     v_mlps = AdapterBank(
-            [VAdapter_(head_dim_s, head_dim_s * 2, head_dim_t) for _ in range(N_t - start)],
+            [KAdapter(8, head_dim_s, 8, head_dim_t) for _ in range(N_t)],
             ).to(device)
-    ckpt = os.path.join(args.output_dir, f"mlp_v_adapters_epoch{10}.pth")
+    ckpt = os.path.join(args.output_dir, f"new_mlp_v_adapters_epoch{4}.pth")
     state_dict = torch.load(ckpt, map_location=device)
     v_mlps.load_state_dict(state_dict)
     v_mlps.eval()
     
     
-    ds = HotPotQADataset({"train": args.valid_file}, num=1000, split="train")
+    ds = HotPotQADataset({"train": args.valid_file}, num=None, split="train")
     dataLoader=DataLoader(ds,batch_size=1,shuffle=True,collate_fn=lambda x:x)
     with torch.no_grad():
         pbar = tqdm(dataLoader, desc="Evaluating")
@@ -1648,16 +1662,16 @@ def test(args):
                 ak_norm += l2norm(k_a).item()
                 av_norm += l2norm(v_a).item()
                 cnt += 1
+           
+            print(f"k_mse:{((kloss/cnt)).item():.4f},v_mse:{((vloss/cnt).item()):.4f}")
+            print(f"k_mse_adapter:{((kloss_a/cnt).item()):.4f},v_mse_adapter:{((vloss_a/cnt).item()):.4f}")
             '''
-            print(f"kloss:{(kloss/cnt).item()},vloss:{(vloss/cnt).item()}")
-            print(f"kloss_a:{(kloss_a/cnt).item()},vloss_a:{(vloss_a/cnt).item()}")
             print(f"vloss_:{(vloss_/cnt).item()}")
             print(f"tk_norm:{(tk_norm/cnt):.4f},tv_norm:{(tv_norm/cnt):.4f}")
             print(f"sk_norm:{(sk_norm/cnt):.4f},sv_norm:{(sv_norm/cnt):.4f}")
             print(f"ak_norm:{(ak_norm/cnt):.4f},av_norm:{(av_norm/cnt):.4f}")
             '''
-            pbar.set_postfix({"kloss:":(kloss/cnt).item(),"kloss_a":(kloss_a/cnt).item()})
-
+            
 def test1(args):
     model_s = AutoModelForCausalLM.from_pretrained(args.model_s, trust_remote_code=True).to(device).eval()
     model_t = AutoModelForCausalLM.from_pretrained(args.model_t, trust_remote_code=True).to(device).eval()

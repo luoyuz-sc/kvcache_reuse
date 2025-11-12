@@ -1,5 +1,5 @@
 import re
-from types import string
+import string
 from collections import Counter
 
 def _white_space_fix(text: str) -> str: return " ".join(text.split())
@@ -22,3 +22,14 @@ def f1_score(pred: str, gold: str) -> float:
     precision = common / len(p_tokens)
     recall = common / len(g_tokens)
     return 2 * precision * recall / (precision + recall)
+
+def postprocess(generated: str) -> str:
+    # Take only the first non-empty line; trim common prefixes.
+    for line in generated.strip().splitlines():
+        ans = line.strip()
+        if not ans:
+            continue
+        ans = re.sub(r"^(Answer|A|Assistant|Final Answer|</think>)\s*[:\-]\s*", "", ans, flags=re.I)
+        ans = ans.strip(" #*`>\"'")
+        return ans
+    return generated.strip()

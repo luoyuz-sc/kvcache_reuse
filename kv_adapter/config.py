@@ -30,4 +30,5 @@ class Args:
     test1: bool = False
     pre: bool = False
     
-device = "cuda"
+device = "cuda:6"
+device0 = "cuda:7"
