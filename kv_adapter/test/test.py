@@ -199,4 +199,100 @@ def test_attn(args):
                 diff = torch.abs(attn0 - attn1)/2
                 diff = diff.sum(dim=1).mean().item()
                 print(f"attn_diff in layer {i} {diff:.4f}")
+                
+def test_attn_fuser(args):
+    tokenizer = AutoTokenizer.from_pretrained(args.model_t)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model_s = AutoModelForCausalLM.from_pretrained(
+        args.model_s, trust_remote_code=True, device_map="auto", torch_dtype=torch.float16 ,offload_folder="./tmp/offload_s")
+    model_t = AutoModelForCausalLM.from_pretrained(
+        args.model_t, trust_remote_code=True, device_map="auto", torch_dtype=torch.float16, offload_folder="./tmp/offload_t")
+    
+    
+    model_s.eval().requires_grad_(False)
+    model_t.eval().requires_grad_(False)
+    
+    reuse_a_layer_start = args.reuse_a_layer_start
+    N_s = len(model_s.model.layers)
+    N_t = len(model_t.model.layers)
+    H_s = model_s.config.num_attention_heads
+    H_t = model_t.config.num_attention_heads
+    
+    layer_attn_fuser = LayerAttentionFuser(N_s, N_t, H_s, H_t).to("cpu")
+    head_attn_fuser = HeadAttentionFuser(N_s, N_t, H_s, H_t).to("cpu")
+    
+    ckpt = os.path.join(args.output_dir, f"layer_attn_fuser_epoch{10}.pth")
+    state_dict = torch.load(ckpt, map_location="cpu")
+    layer_attn_fuser.load_state_dict(state_dict)
+    layer_attn_fuser.eval()
+    
+    ckpt = os.path.join(args.output_dir, f"head_attn_fuser_epoch{10}.pth")
+    state_dict = torch.load(ckpt, map_location="cpu")
+    head_attn_fuser.load_state_dict(state_dict)
+    head_attn_fuser.eval()
+
+    # Load eval data
+    ds = HotPotQADataset({"valid": args.train_file}, num=100, split="valid")
+    dataloader = DataLoader(ds, batch_size=1, shuffle=False, collate_fn=lambda x: x)
+    print(f"Evaluating on {args.valid_file} with {len(ds)} examples.")
+    
+    for epoch in range(args.epochs):
+        total_loss = 0.0
+        strlen = 0
+        loss_list = []
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+        for step, batch in enumerate(pbar):
+            ex = batch[0]
+            input_id_list = ds.get_input_ids_list(tokenizer,ex)
+            if step<70:
+                strlen = max(strlen, len(input_id_list))
+            elif len(input_id_list) > strlen:
+                print(f"skip {step}: {len(input_id_list)} > {strlen}\n")
+                continue
+
+            device_t = module_device(model_t.get_input_embeddings() or model_t.embed_tokens)
+            device_s = module_device(model_s.get_input_embeddings() or model_s.embed_tokens)
+
+            input_ids_t = torch.tensor([input_id_list], device=device_t)
+
+            # prefill with t
+            with torch.inference_mode():
+                t_out = model_t(
+                    input_ids=input_ids_t,
+                    use_cache=True,
+                    output_hidden_states=False,
+                    output_attentions=False,
+                )
+                
+                new_t_cache = reuse_attn_distr_with_fuser(model_t, model_s, input_id_list, 
+                                layer_attn_fuser, head_attn_fuser, args)
+                past = DynamicCache.from_legacy_cache(past_key_values=new_t_cache)
+                
+                answer = "Answer:" + ex['answer']
+                answer_ids = tokenizer(answer).input_ids
+                answer_ids = torch.tensor([answer_ids],device=device_t)
+            with torch.inference_mode():  
+                t_out = model_t(
+                    input_ids=answer_ids,
+                    use_cache=True,
+                    past_key_values=past,
+                    return_dict = True,
+                    labels = answer_ids
+                )
+                loss = t_out.loss.item()
+            loss_list.append(loss)
+
+            total_loss += loss
+            avg_loss = total_loss / (step + 1)
+            pbar.set_postfix({"loss": f"{loss:.6f}", "avg_loss": f"{avg_loss:.6f}"})
+        
+        # print variance, mean, max, min of loss
+        variance = sum((x - avg_loss) ** 2 for x in loss_list) / len(loss_list)
+        mean_loss = sum(loss_list) / len(loss_list)
+        max_loss = max(loss_list)
+        min_loss = min(loss_list)
+        print(f"Loss variance: {variance:.6f}, mean: {mean_loss:.6f}, max: {max_loss:.6f}, min: {min_loss:.6f}")
+        print("list:",loss_list)
                     

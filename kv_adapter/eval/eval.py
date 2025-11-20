@@ -308,14 +308,31 @@ def evaluate_attn_distr(args, adapter=True):
         tokenizer.pad_token = tokenizer.eos_token
 
     model_s = AutoModelForCausalLM.from_pretrained(
-        args.model_s, trust_remote_code=True, device_map="auto", 
-        torch_dtype=torch.float16, offload_folder="./tmp/offload_s")
+        args.model_s, trust_remote_code=True, device_map="auto",  offload_folder="./tmp/offload_s")
     model_t = AutoModelForCausalLM.from_pretrained(
-        args.model_t, trust_remote_code=True, device_map="auto", 
-        torch_dtype=torch.float16, offload_folder="./tmp/offload_t")
+        args.model_t, trust_remote_code=True, device_map="auto",  offload_folder="./tmp/offload_t")
+    
+    reuse_a_layer_start = args.reuse_a_layer_start
+    N_s = len(model_s.model.layers)
+    N_t = len(model_t.model.layers)
+    H_s = model_s.config.num_attention_heads
+    H_t = model_t.config.num_attention_heads
+    
+    layer_attn_fuser = LayerAttentionFuser(N_s, N_t, H_s, H_t).to("cpu")
+    head_attn_fuser = HeadAttentionFuser(N_s, N_t, H_s, H_t).to("cpu")
+    
+    ckpt = os.path.join(args.output_dir, f"layer_attn_fuser_epoch{10}.pth")
+    state_dict = torch.load(ckpt, map_location="cpu")
+    layer_attn_fuser.load_state_dict(state_dict)
+    layer_attn_fuser.eval()
+    
+    ckpt = os.path.join(args.output_dir, f"head_attn_fuser_epoch{10}.pth")
+    state_dict = torch.load(ckpt, map_location="cpu")
+    head_attn_fuser.load_state_dict(state_dict)
+    head_attn_fuser.eval()
 
     # Load eval data
-    ds = HotPotQADataset({"valid": args.valid_file}, num=1000, split="valid")
+    ds = HotPotQADataset({"valid": args.train_file}, num=1000, split="valid")
     print(f"Evaluating on {args.valid_file} with {len(ds)} examples.")
     
     total_em = total_f1 = 0.0
@@ -323,11 +340,11 @@ def evaluate_attn_distr(args, adapter=True):
         pbar = tqdm(ds, desc="Evaluating")
         for step, ex in enumerate(pbar):
             input_id_list = ds.get_input_ids_list(tokenizer,ex)
-            pred = attnr_generate_distr(model_t,model_s, tokenizer,  input_id_list, args)
+            pred, text = attnr_generate_distr(model_t,model_s, tokenizer,  input_id_list, layer_attn_fuser, head_attn_fuser, args)
             #pred = pure_generate(model_t, tokenizer, input_id_list, args)
             gold = ex["answer"]
             with open(f"./log/qa_result.log", "a") as f:
-                f.write(f"Q: {ex['question']}\nA: {pred}\nG: {gold}\n")
+                f.write(f"Q: {ex['question']}\nA: {text}\nG: {gold}\n")
             em = exact_match(pred, gold)
             f1 = f1_score(pred, gold)
     

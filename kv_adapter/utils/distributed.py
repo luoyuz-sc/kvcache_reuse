@@ -26,10 +26,10 @@ def load_sharded_model(model_name_or_path, dtype=torch.float16, use_4bit=False, 
 
 def module_device(module):
     # try parameters
-    for p in module.parameters(recurse=False):
+    for p in module.parameters(recurse=True):
         return p.device
     # fallback: try buffers
-    for b in module.buffers(recurse=False):
+    for b in module.buffers(recurse=True):
         return b.device
     # default
     return torch.device("cpu")

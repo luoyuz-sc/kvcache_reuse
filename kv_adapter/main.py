@@ -8,7 +8,7 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 from train import *
 from eval import *
-from test import *
+from test.test import *
 
 if __name__ == "__main__":
     
@@ -30,6 +30,7 @@ if __name__ == "__main__":
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--res_train", action="store_true")
     parser.add_argument("--eval", action="store_true")
+    parser.add_argument("--eval_dis", action="store_true")
     parser.add_argument("--attn_eval", action="store_true")
     parser.add_argument("--res_eval", action="store_true")
     parser.add_argument("--test", action="store_true")
@@ -50,12 +51,12 @@ if __name__ == "__main__":
     elif args.test1:
         test1(args)
     elif args.test_attn:
-        test_attn(args)
+        test_attn_fuser(args)
     elif args.res_train:
         train_conditional_adapter_perhead_cnn(args)
     else:
         if args.train:
-            train(args)
+            train_attn_fuser(args)
         elif args.res_eval:
             evaluate_res(args)
         elif args.attn_eval:
@@ -63,3 +64,5 @@ if __name__ == "__main__":
         elif args.eval:
             #eval_wo_reuse(args)
             evaluate(args, adapter=args.adapter)
+        elif args.eval_dis:
+            evaluate_attn_distr(args)

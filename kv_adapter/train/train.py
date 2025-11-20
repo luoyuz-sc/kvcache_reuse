@@ -1,5 +1,5 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from models import AdapterBank, KAdapter, VAdapter, ConditionalResidualAdapterPerHeadCNN
+from models import *
 from torch.utils.data import DataLoader, Dataset
 from data import *
 from tqdm import tqdm
@@ -557,3 +557,248 @@ def train_conditional_adapter_perhead_cnn(args):
             f.write(f"epoch{epoch}: kloss: {epoch_loss_k / 10000}, vloss: {epoch_loss_v / 10000}")
         
     print("Training finished.")
+    
+def train_attn_fuser(args):
+    tokenizer = AutoTokenizer.from_pretrained(args.model_t)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model_s = AutoModelForCausalLM.from_pretrained(
+        args.model_s, trust_remote_code=True, device_map="auto", torch_dtype=torch.float16 ,offload_folder="./tmp/offload_s")
+    model_t = AutoModelForCausalLM.from_pretrained(
+        args.model_t, trust_remote_code=True, device_map="auto", torch_dtype=torch.float16, offload_folder="./tmp/offload_t")
+    
+    
+    model_s.eval().requires_grad_(False)
+    model_t.eval().requires_grad_(False)
+    
+    reuse_a_layer_start = args.reuse_a_layer_start
+    N_s = len(model_s.model.layers)
+    N_t = len(model_t.model.layers)
+    H_s = model_s.config.num_attention_heads
+    H_t = model_t.config.num_attention_heads
+    
+    layer_attn_fuser = LayerAttentionFuser(N_s, N_t, H_s, H_t).to("cpu")
+    head_attn_fuser = HeadAttentionFuser(N_s, N_t, H_s, H_t).to("cpu")
+    
+    ckpt = os.path.join(args.output_dir, f"layer_attn_fuser_epoch{10}.pth")
+    state_dict = torch.load(ckpt, map_location="cpu")
+    layer_attn_fuser.load_state_dict(state_dict)
+    
+    ckpt = os.path.join(args.output_dir, f"head_attn_fuser_epoch{10}.pth")
+    state_dict = torch.load(ckpt, map_location="cpu")
+    head_attn_fuser.load_state_dict(state_dict)
+    
+    optimizer = AdamW(
+        list(layer_attn_fuser.parameters()) + list(head_attn_fuser.parameters()),
+        lr=getattr(args, "lr", 1e-4),
+        weight_decay=getattr(args, "weight_decay", 0.0)
+    )
+
+    # Load eval data
+    ds = HotPotQADataset({"train": args.train_file}, begin=1000, end=5000, split="train")
+    dataloader = DataLoader(ds, batch_size=1, shuffle=False, collate_fn=lambda x: x)
+    print(f"Evaluating on {args.train_file} with {len(ds)} examples.")
+    
+    for epoch in range(args.epochs):
+        layer_attn_fuser.train()
+        head_attn_fuser.train()
+        total_loss = 0.0
+        strlen = 0
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+        for step, batch in enumerate(pbar):
+            ex = batch[0]
+            input_id_list = ds.get_input_ids_list(tokenizer,ex)
+            if step<70:
+                strlen = max(strlen, len(input_id_list))
+            elif len(input_id_list) > strlen:
+                print(f"skip {step}\n")
+                continue
+            
+            device_t = module_device(model_t.get_input_embeddings() or model_t.embed_tokens)
+            device_s = module_device(model_s.get_input_embeddings() or model_s.embed_tokens)
+
+            input_ids_s = torch.tensor([input_id_list], device=device_s)
+            input_ids_t = torch.tensor([input_id_list], device=device_t)
+
+            # prefill with s
+            with torch.inference_mode():
+                t_out = model_t(
+                    input_ids=input_ids_t,
+                    use_cache=True,
+                    output_hidden_states=False,
+                    output_attentions=False,
+                )
+                
+                
+            new_t_cache = reuse_attn_distr_with_fuser(model_t, model_s, input_id_list, 
+                            layer_attn_fuser, head_attn_fuser, args)
+            past = DynamicCache.from_legacy_cache(past_key_values=new_t_cache)
+            
+            answer = "Answer:" + ex['answer']
+            answer_ids = tokenizer(answer).input_ids
+            answer_ids = torch.tensor([answer_ids],device=device_t)
+            t_out = model_t(
+                input_ids=answer_ids,
+                use_cache=True,
+                past_key_values=past,
+                return_dict = True,
+                labels = answer_ids
+            )
+            loss = t_out.loss
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            avg_loss = total_loss / (step + 1)
+            pbar.set_postfix({"loss": f"{loss.item():.6f}", "avg_loss": f"{avg_loss:.6f}"})
+            
+        os.makedirs(args.output_dir, exist_ok=True)
+        save_path_layer = os.path.join(args.output_dir, f"layer_attn_fuser_epoch{epoch+11}.pth")
+        save_path_head = os.path.join(args.output_dir, f"head_attn_fuser_epoch{epoch+11}.pth")
+        torch.save(layer_attn_fuser.state_dict(), save_path_layer)
+        torch.save(head_attn_fuser.state_dict(), save_path_head)
+        print(f"✅ Saved adapters to {save_path_layer} and {save_path_head}")
+        
+from accelerate import Accelerator
+from accelerate.utils import DistributedType
+
+def train_attn_fuser_accelerated(args):
+
+    accelerator = Accelerator(
+        mixed_precision="fp16",  # 可选 'no', 'fp16', 'bf16'
+        gradient_accumulation_steps=getattr(args, "grad_accum_steps", 1),
+    )
+    
+    N_s = len(model_s.model.layers)
+    N_t = len(model_t.model.layers)
+    H_s = model_s.config.num_attention_heads
+    H_t = model_t.config.num_attention_heads
+
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_t)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+
+    model_s = AutoModelForCausalLM.from_pretrained(
+        args.model_s,
+        torch_dtype=torch.float16,
+        device_map="auto",  # 或 "auto", 但建议 offload 到 CPU
+        offload_folder="./tmp/offload_s",
+        trust_remote_code=True,
+    )
+    model_s.eval().requires_grad_(False)
+
+    model_t = AutoModelForCausalLM.from_pretrained(
+        args.model_t,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        offload_folder="./tmp/offload_t",
+        trust_remote_code=True,
+    )
+    model_t.eval().requires_grad_(False)
+
+
+    layer_attn_fuser = LayerAttentionFuser(N_s, N_t, H_s, H_t)
+    head_attn_fuser = HeadAttentionFuser(N_s, N_t, H_s, H_t)
+
+    optimizer = AdamW(
+        list(layer_attn_fuser.parameters()) + list(head_attn_fuser.parameters()),
+        lr=args.lr or 1e-4,
+        weight_decay=args.weight_decay or 0.0
+    )
+
+
+    ds = HotPotQADataset({"train": args.train_file}, num=1000, split="train")
+    dataloader = DataLoader(ds, batch_size=1, shuffle=True, collate_fn=lambda x: x)
+
+
+    layer_attn_fuser, head_attn_fuser, optimizer, dataloader = accelerator.prepare(
+        layer_attn_fuser, head_attn_fuser, optimizer, dataloader
+    )
+
+    print(f"Using device: {accelerator.device}")
+    print(f"Distributed type: {accelerator.distributed_type}")
+
+    for epoch in range(args.epochs):
+        layer_attn_fuser.train()
+        head_attn_fuser.train()
+        total_loss = 0.0
+
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}", disable=not accelerator.is_main_process)
+
+        for step, batch in enumerate(pbar):
+            ex = batch[0]
+            input_id_list = ds.get_input_ids_list(tokenizer, ex)
+
+            temperature = args.temperature
+            top_p = args.top_p
+
+            with torch.no_grad():
+                input_ids_s = torch.tensor([input_id_list]).to(accelerator.device)  # 始终在 CPU
+                with accelerator.autocast():
+                    s_out = model_s(input_ids=input_ids_s, use_cache=True, output_attentions=False)
+                    first_token = sample_next_token(s_out.logits[:, -1, :].squeeze(0), temperature, top_p)
+                    last_token_s = torch.tensor([[first_token]]).to(accelerator.device)
+
+                    s_out_next = model_s(input_ids=last_token_s, use_cache=True)
+                    logit_label = s_out_next.logits.detach().float()  # [1, vocab]
+                    del s_out, s_out_next; torch.cuda.empty_cache()
+
+                # ==== Teacher 推理（也尽量 offload）====
+                input_ids_t = torch.tensor([input_id_list]).to(accelerator.device)
+                t_out = model_t(input_ids=input_ids_t, use_cache=True)
+                first_token = sample_next_token(t_out.logits[:, -1, :].squeeze(0), temperature, top_p)
+                last_token_t = torch.tensor([[first_token]]).to(accelerator.device)
+                pkv_t_cpu = t_out.past_key_values
+                del t_out; torch.cuda.empty_cache()
+
+            # ==== 使用 fuser 构造新的 KV cache ====
+            # 这个函数内部要小心处理设备转移
+            new_pkv = reuse_attn_distr_with_fuser_accelerated(
+                model_t, model_s, input_id_list,
+                layer_attn_fuser, head_attn_fuser, args,
+                pkv_t_cpu  # 已在 CPU
+            )
+            past = DynamicCache.from_legacy_cache(new_pkv)
+
+            # ==== 最后一步：只把需要的部分移到 GPU 训练 fuser 输出 ====
+            last_token_t = last_token_t.to(accelerator.device)
+            with accelerator.autocast():
+                out = model_t(
+                    input_ids=last_token_t,
+                    past_key_values=past,
+                    use_cache=True,
+                    output_attentions=False,
+                )
+                logits = out.logits
+                logit_label = logit_label.to(logits.device)
+
+                loss = distillation_loss(logits, logit_label, temperature=temperature)
+
+            # 反向传播由 accelerator 管理
+            accelerator.backward(loss)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            total_loss += loss.item()
+            avg_loss = total_loss / (step + 1)
+            if accelerator.is_main_process:
+                pbar.set_postfix({"loss": f"{loss.item():.6f}", "avg_loss": f"{avg_loss:.6f}"})
+
+        # ==== 保存模型 ====
+        if accelerator.is_main_process:
+            os.makedirs(args.output_dir, exist_ok=True)
+            save_path_layer = os.path.join(args.output_dir, f"layer_attn_fuser_epoch{epoch+1}.pth")
+            save_path_head = os.path.join(args.output_dir, f"head_attn_fuser_epoch{epoch+1}.pth")
+
+            # Save only current process weights
+            unwrapped_layer = accelerator.unwrap_model(layer_attn_fuser)
+            unwrapped_head = accelerator.unwrap_model(head_attn_fuser)
+
+            torch.save(unwrapped_layer.state_dict(), save_path_layer)
+            torch.save(unwrapped_head.state_dict(), save_path_head)
+            print(f"✅ Saved adapters to {save_path_layer} and {save_path_head}")
